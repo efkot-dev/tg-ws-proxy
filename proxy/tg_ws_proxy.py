@@ -339,7 +339,11 @@ async def _handle_client(reader, writer, secret: bytes):
         ws_timed_out = False
         all_redirects = True
 
-        ws = await ws_pool.get(dc, is_media, target, domains) if not is_test_dc else None
+        allow_pool_refill = now >= ip_fail_until.get(target, 0)
+        ws = await ws_pool.get(
+            dc, is_media, target, domains,
+            allow_refill=allow_pool_refill,
+        ) if not is_test_dc else None
         if ws:
             log.info("[%s] DC%d%s -> pool hit via %s",
                      label, dc, media_tag, target)
@@ -413,6 +417,7 @@ async def _handle_client(reader, writer, secret: bytes):
 
         dc_fail_until.pop(dc_key, None)
         ip_fail_until.pop(target, None)
+        ws_pool.report_success(dc, is_media)
         stats.connections_ws += 1
 
         splitter = None
@@ -674,6 +679,23 @@ def main():
     ap.add_argument('--proxy-protocol', action='store_true',
                     help='Accept PROXY protocol v1 header '
                          '(for use behind nginx/haproxy with proxy_protocol on)')
+    ap.add_argument('--proxy-type', choices=['socks5', 'http', ''], default='',
+                   help='Outbound proxy type (socks5, http, or empty)')
+    ap.add_argument('--proxy-host', type=str, default='',
+                   help='Outbound proxy host')
+    ap.add_argument('--proxy-port', type=int, default=0,
+                   help='Outbound proxy port')
+    ap.add_argument('--proxy-user', type=str, default='',
+                   help='Outbound proxy username')
+    ap.add_argument('--proxy-pass', type=str, default='',
+                   help='Outbound proxy password')
+    ap.add_argument('--relay-url', type=str, default='', metavar='URL',
+                    help='Relay byte-pipe base URL (HTTPS); enables relay '
+                         'fallback (last in chain) when direct WS/TCP blocked')
+    ap.add_argument('--relay-token', type=str, default='', metavar='TOKEN',
+                    help='Relay auth token (RELAY_TOKEN on the relay server)')
+    ap.add_argument('--relay-only', action='store_true',
+                    help='Force all fallback traffic through relay (disable TCP/CF fallback)')
     args = ap.parse_args()
 
     if not args.dc_ip:
@@ -711,6 +733,14 @@ def main():
     proxy_config.fake_tls_domain = args.fake_tls_domain.strip()
     proxy_config.proxy_protocol = args.proxy_protocol
     proxy_config.force_test_dc = args.force_test_dc
+    proxy_config.outbound_proxy_type = args.proxy_type
+    proxy_config.outbound_proxy_host = args.proxy_host
+    proxy_config.outbound_proxy_port = args.proxy_port
+    proxy_config.outbound_proxy_user = args.proxy_user
+    proxy_config.outbound_proxy_password = args.proxy_pass
+    proxy_config.relay_url = args.relay_url.strip()
+    proxy_config.relay_token = args.relay_token.strip()
+    proxy_config.relay_only = args.relay_only
 
     log_level = logging.DEBUG if args.verbose else logging.INFO
     log_fmt = logging.Formatter('%(asctime)s  %(levelname)-5s  %(message)s',

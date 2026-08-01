@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 import os
 import webbrowser
+import asyncio
+from proxy.outbound_test import test_outbound_proxy
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -219,6 +221,21 @@ def _show_multi_connectivity_results(title_base: str, per_domain: dict,
     _mb.showinfo(title, msg, parent=root)
     root.destroy()
 
+def _show_outbound_test_result(ok: bool, msg: str) -> None:
+    print("[outbound-test] show called", ok, msg, flush=True)
+    import tkinter as _tk
+    from tkinter import messagebox as _mb
+    title = t("connectivity.available" if ok else "connectivity.unavailable",
+              title=t("connectivity.outbound_title"))
+    root = _tk.Tk()
+    root.withdraw()
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+    _mb.showinfo(title, msg, parent=root)
+    root.destroy()
+
 _INNER_W = 396
 
 _APPEARANCE_KEYS = ("auto", "light", "dark")
@@ -295,6 +312,11 @@ def _labeled_entry(ctk, parent, theme, label_text, value, *, tip="", width=0, pa
         attach_tooltip_to_widgets([lbl, ent, col], tip)
     return col, var
 
+def _parse_port(value: str) -> int:
+    try:
+        return int((value or "").strip())
+    except ValueError:
+        return 0
 
 def tray_settings_scroll_and_footer(
     ctk: Any,
@@ -355,6 +377,11 @@ class TrayConfigFormWidgets:
     cfproxy_worker_domain_var: Optional[Any] = None
     appearance_var: Optional[Any] = None
     language_var: Optional[Any] = None
+    outbound_proxy_type_var: Optional[Any] = None
+    outbound_proxy_host_var: Optional[Any] = None
+    outbound_proxy_port_var: Optional[Any] = None
+    outbound_proxy_user_var: Optional[Any] = None
+    outbound_proxy_pass_var: Optional[Any] = None
 
 
 def install_tray_config_form(
@@ -697,6 +724,129 @@ def install_tray_config_form(
     cfproxy_worker_domain_var.trace_add("write", _sync_cfworker_test_button)
     _sync_cfworker_test_button()
 
+    # --- Секция Исходящий прокси ---
+    proxy_inner = _config_section(ctk, frame, theme, t("section.outbound_proxy"))
+
+    type_lbl = _label(ctk, proxy_inner, theme, t("label.outbound_proxy_type"), size=11)
+    type_lbl.pack(anchor="w", pady=(0, 2))
+    outbound_proxy_type_var = ctk.StringVar(value=cfg.get("outbound_proxy_type", ""))
+    type_row = ctk.CTkFrame(proxy_inner, fg_color="transparent")
+    type_row.pack(fill="x", pady=(0, 4))
+
+    proxy_type_combo = ctk.CTkComboBox(
+        type_row, values=["", "socks5", "http"],
+        variable=outbound_proxy_type_var,
+        height=32,
+        font=(theme.ui_font_family, 12),
+        text_color=theme.text_primary,
+        fg_color=theme.bg,
+        border_color=theme.field_border,
+        button_color=theme.field_border,
+        button_hover_color=theme.text_secondary,
+        dropdown_fg_color=theme.field_bg,
+        dropdown_text_color=theme.text_primary,
+        dropdown_hover_color=theme.field_border,
+        corner_radius=8,
+        state="readonly",
+    )
+    proxy_type_combo.pack(side="left")
+
+    _out_test_btn = None
+
+    def _on_test_outbound():
+        btn = _out_test_btn
+        if btn is None:
+            return
+        btn.configure(text=t("button.test_loading"), state="disabled")
+        proxy_args = (
+            outbound_proxy_type_var.get().strip().lower(),
+            outbound_proxy_host_var.get().strip(),
+            _parse_port(outbound_proxy_port_var.get()),
+            outbound_proxy_user_var.get().strip(),
+            outbound_proxy_pass_var.get().strip(),
+        )
+
+        def _worker():
+            try:
+                try:
+                    ok, key, res = asyncio.run(test_outbound_proxy(params=proxy_args))
+                except BaseException as e:
+                    ok, key, res = False, "connectivity.outbound_fail", {"err": e}
+                res = dict(res, title=t("connectivity.outbound_title"))
+                msg = t(key, **res)
+            except BaseException as e:
+                ok, msg = False, f"{e!r}"
+
+            def _finish():
+                try:
+                    _show_outbound_test_result(ok, msg)
+                except BaseException:
+                    pass
+                if btn is not None:
+                    try:
+                        btn.configure(text=t("button.test"), state="normal")
+                    except Exception:
+                        pass
+
+            if btn is not None:
+                btn.after(0, _finish)
+
+        import threading as _threading
+        _threading.Thread(target=_worker, daemon=True).start()
+
+    _out_test_btn = ctk.CTkButton(
+        type_row, text=t("button.test"), width=56, height=32,
+        font=(theme.ui_font_family, 13), corner_radius=8,
+        fg_color=theme.tg_blue, hover_color=theme.tg_blue_hover,
+        text_color="#ffffff", border_width=1, border_color=theme.field_border,
+        command=_on_test_outbound,
+    )
+    _out_test_btn.pack(side="right")
+
+    attach_tooltip_to_widgets([type_lbl, proxy_type_combo], t("tip.outbound_proxy_type"))
+
+    hp_row = ctk.CTkFrame(proxy_inner, fg_color="transparent")
+    hp_row.pack(fill="x", pady=(0, 4))
+
+    host_col = ctk.CTkFrame(hp_row, fg_color="transparent")
+    host_col.pack(side="left", fill="x", expand=True, padx=(0, 10))
+    host_lbl = _label(ctk, host_col, theme, t("label.outbound_proxy_host"), size=12)
+    host_lbl.pack(anchor="w", pady=(0, 2))
+    outbound_proxy_host_var = ctk.StringVar(value=cfg.get("outbound_proxy_host", ""))
+    host_e = _entry(ctk, host_col, theme, var=outbound_proxy_host_var, height=32, radius=8)
+    host_e.pack(fill="x")
+    attach_tooltip_to_widgets([host_lbl, host_e, host_col], t("tip.outbound_proxy_host"))
+
+    port_col = ctk.CTkFrame(hp_row, fg_color="transparent")
+    port_col.pack(side="left")
+    port_lbl = _label(ctk, port_col, theme, t("label.outbound_proxy_port"), size=12)
+    port_lbl.pack(anchor="w", pady=(0, 2))
+    outbound_proxy_port_var = ctk.StringVar(value=str(cfg.get("outbound_proxy_port", 0)))
+    port_e = _entry(ctk, port_col, theme, var=outbound_proxy_port_var, width=100, height=32, radius=8)
+    port_e.pack(anchor="w")
+    attach_tooltip_to_widgets([port_lbl, port_e, port_col], t("tip.outbound_proxy_port"))
+
+    auth_row = ctk.CTkFrame(proxy_inner, fg_color="transparent")
+    auth_row.pack(fill="x")
+
+    user_col = ctk.CTkFrame(auth_row, fg_color="transparent")
+    user_col.pack(side="left", fill="x", expand=True, padx=(0, 10))
+    user_lbl = _label(ctk, user_col, theme, t("label.outbound_proxy_user"), size=12)
+    user_lbl.pack(anchor="w", pady=(0, 2))
+    outbound_proxy_user_var = ctk.StringVar(value=cfg.get("outbound_proxy_user", ""))
+    user_e = _entry(ctk, user_col, theme, var=outbound_proxy_user_var, height=32, radius=8)
+    user_e.pack(fill="x")
+    attach_tooltip_to_widgets([user_lbl, user_e, user_col], t("tip.outbound_proxy_user"))
+
+    pass_col = ctk.CTkFrame(auth_row, fg_color="transparent")
+    pass_col.pack(side="left", fill="x", expand=True)
+    pass_lbl = _label(ctk, pass_col, theme, t("label.outbound_proxy_pass"), size=12)
+    pass_lbl.pack(anchor="w", pady=(0, 2))
+    outbound_proxy_pass_var = ctk.StringVar(value=cfg.get("outbound_proxy_password", ""))
+    pass_e = _entry(ctk, pass_col, theme, var=outbound_proxy_pass_var, height=32, radius=8)
+    pass_e.pack(fill="x")
+    attach_tooltip_to_widgets([pass_lbl, pass_e, pass_col], t("tip.outbound_proxy_pass"))
+
     log_inner = _config_section(ctk, frame, theme, t("section.logs"))
 
     verbose_var = ctk.BooleanVar(value=cfg.get("verbose", False))
@@ -784,6 +934,11 @@ def install_tray_config_form(
         cfproxy_worker_domain_var=cfproxy_worker_domain_var,
         appearance_var=appearance_var,
         language_var=language_var,
+        outbound_proxy_type_var=outbound_proxy_type_var,
+        outbound_proxy_host_var=outbound_proxy_host_var,
+        outbound_proxy_port_var=outbound_proxy_port_var,
+        outbound_proxy_user_var=outbound_proxy_user_var,
+        outbound_proxy_pass_var=outbound_proxy_pass_var,
     )
 
 
@@ -876,6 +1031,24 @@ def validate_config_form(
         new_cfg["cfproxy_user_domain"] = coerce_domain_list(widgets.cfproxy_user_domain_var.get())
     if widgets.cfproxy_worker_domain_var is not None:
         new_cfg["cfproxy_worker_domain"] = coerce_domain_list(widgets.cfproxy_worker_domain_var.get())
+    # --- Исходящий прокси ---
+    if widgets.outbound_proxy_type_var is not None:
+        proxy_type = widgets.outbound_proxy_type_var.get().strip()
+        if proxy_type:
+            new_cfg["outbound_proxy_type"] = proxy_type
+            new_cfg["outbound_proxy_host"] = widgets.outbound_proxy_host_var.get().strip()
+            try:
+                new_cfg["outbound_proxy_port"] = int(widgets.outbound_proxy_port_var.get().strip())
+            except ValueError:
+                new_cfg["outbound_proxy_port"] = 0
+            new_cfg["outbound_proxy_user"] = widgets.outbound_proxy_user_var.get().strip()
+            new_cfg["outbound_proxy_password"] = widgets.outbound_proxy_pass_var.get().strip()
+        else:
+            new_cfg["outbound_proxy_type"] = ""
+            new_cfg["outbound_proxy_host"] = ""
+            new_cfg["outbound_proxy_port"] = 0
+            new_cfg["outbound_proxy_user"] = ""
+            new_cfg["outbound_proxy_password"] = ""
     if widgets.appearance_var is not None:
         new_cfg["appearance"] = _appearance_to_cfg(widgets.appearance_var.get())
     if widgets.language_var is not None:
