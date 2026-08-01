@@ -3,9 +3,9 @@ on:
   push:
     branches: [main]
     paths:
-      - 'main.go'
-      - 'go.mod'
-      - 'Dockerfile'
+      - 'RelTg/main.go'
+      - 'RelTg/go.mod'
+      - 'RelTg/Dockerfile'
       - '.github/workflows/docker_build.yml'
 jobs:
   build:
@@ -19,7 +19,7 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - uses: docker/build-push-action@v5
         with:
-          context: .
+          context: ./RelTg
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ secrets.DOCKERHUB_USER }}/relay:latest
