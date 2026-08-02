@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -188,7 +189,7 @@ func handleUp(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no session", http.StatusGone)
 		return
 	}
-	if _, err := ioCopy(s.conn, r.Body); err != nil {
+	if _, err := io.Copy(s.conn, r.Body); err != nil {
 		log.Printf("sid up write err: %v", err)
 		s.close()
 		http.Error(w, "write failed", http.StatusBadGateway)
