@@ -2,11 +2,9 @@ package main
 
 import (
 	"crypto/rand"
-	"crypto/sha1"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"io"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -21,10 +19,36 @@ const (
 	dialTimeout = 10 * time.Second
 	downBuf     = 256
 	readBuf     = 256 * 1024
-	wsMagic     = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+	probeTTL    = 30 * time.Second
+	probeDial   = 3 * time.Second
 )
 
 var token = os.Getenv("RELAY_TOKEN")
+
+// Telegram production DC IPs. В OPEN-режиме (без токена) relay принимает
+// dst ТОЛЬКО из этого набора — иначе нода превращается в открытый прокси.
+var tgDCIPs = map[string]bool{
+	"149.154.175.50": true, // DC1
+	"149.154.167.51": true, // DC2
+	"149.154.175.100": true, // DC3
+	"149.154.167.91": true, // DC4
+	"149.154.171.5": true, // DC5
+	"91.105.192.100": true, // DC203
+}
+
+type probeTarget struct {
+	dc int
+	ip string
+}
+
+var probeTargets = []probeTarget{
+	{1, "149.154.175.50"},
+	{2, "149.154.167.51"},
+	{3, "149.154.175.100"},
+	{4, "149.154.167.91"},
+	{5, "149.154.171.5"},
+	{203, "91.105.192.100"},
+}
 
 type session struct {
 	conn net.Conn
@@ -41,8 +65,9 @@ func (s *session) close() {
 }
 
 var (
-	mu       sync.Mutex
-	sessions = map[string]*session{}
+	mu        sync.Mutex
+	sessions  = map[string]*session{}
+	startedAt = time.Now()
 )
 
 func newSID() string {
@@ -67,6 +92,28 @@ func checkToken(r *http.Request) bool {
 	}
 	return r.URL.Query().Get("tok") == token
 }
+
+// allowedDst: приватный режим (токен задан) — любой dst, владелец доверяет себе.
+// OPEN-режим (токена нет) — только Telegram DC, иначе abuse/скан портов.
+func allowedDst(dst string) bool {
+	if token != "" {
+		return true
+	}
+	host := dst
+	if i := strings.LastIndex(dst, ":"); i >= 0 {
+		host = dst[:i]
+	}
+	return tgDCIPs[host]
+}
+
+func mode() string {
+	if token == "" {
+		return "PUBLIC (DC whitelist)"
+	}
+	return "PRIVATE (token)"
+}
+
+// ---------- HTTP long-poll ----------
 
 func readerLoop(s *session, sid string) {
 	defer func() {
@@ -109,6 +156,10 @@ func handleOpen(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "dst required", http.StatusBadRequest)
 		return
 	}
+	if !allowedDst(dst) {
+		http.Error(w, "dst not allowed", http.StatusForbidden)
+		return
+	}
 	conn, err := net.DialTimeout("tcp", dst, dialTimeout)
 	if err != nil {
 		w.WriteHeader(http.StatusBadGateway)
@@ -137,7 +188,7 @@ func handleUp(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no session", http.StatusGone)
 		return
 	}
-	if _, err := io.Copy(s.conn, r.Body); err != nil {
+	if _, err := ioCopy(s.conn, r.Body); err != nil {
 		log.Printf("sid up write err: %v", err)
 		s.close()
 		http.Error(w, "write failed", http.StatusBadGateway)
@@ -178,9 +229,10 @@ func handleClose(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+	sid := r.URL.Query().Get("sid")
 	mu.Lock()
-	s := sessions[r.URL.Query().Get("sid")]
-	delete(sessions, r.URL.Query().Get("sid"))
+	s := sessions[sid]
+	delete(sessions, sid)
 	mu.Unlock()
 	if s != nil {
 		s.close()
@@ -194,6 +246,10 @@ func handleProbe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dst := normDst(r.URL.Query().Get("dst"))
+	if dst == "" || !allowedDst(dst) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "err": "dst not allowed"})
+		return
+	}
 	conn, err := net.DialTimeout("tcp", dst, dialTimeout)
 	if err != nil {
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "err": err.Error()})
@@ -203,116 +259,102 @@ func handleProbe(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 }
 
-// handleWsEcho — минимальный WS-эхо (stdlib only) для проверки,
-// пропускает ли корп-прокси Upgrade: websocket к этому домену.
-func handleWsEcho(w http.ResponseWriter, r *http.Request) {
-	if !checkToken(r) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-	if r.Header.Get("Upgrade") != "websocket" {
-		http.Error(w, "expected websocket upgrade", http.StatusBadRequest)
-		return
-	}
-	key := r.Header.Get("Sec-WebSocket-Key")
-	if key == "" {
-		http.Error(w, "missing Sec-WebSocket-Key", http.StatusBadRequest)
-		return
-	}
-	h := sha1.New()
-	h.Write([]byte(key + wsMagic))
-	accept := base64.StdEncoding.EncodeToString(h.Sum(nil))
-	hj, ok := w.(http.Hijacker)
-	if !ok {
-		http.Error(w, "hijack not supported", http.StatusInternalServerError)
-		return
-	}
-	conn, bufrw, err := hj.Hijack()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	defer conn.Close()
-	_, _ = bufrw.WriteString("HTTP/1.1 101 Switching Protocols\r\n" +
-		"Upgrade: websocket\r\nConnection: Upgrade\r\n" +
-		"Sec-WebSocket-Accept: " + accept + "\r\n\r\n")
-	_ = bufrw.Flush()
-	log.Printf("ws echo: handshake ok, remote=%s", conn.RemoteAddr())
-	buf := make([]byte, 65536)
-	for {
-		n, err := conn.Read(buf)
-		if err != nil {
-			log.Printf("ws echo: read err: %v", err)
-			return
-		}
-		if n < 2 {
-			continue
-		}
-		opcode := buf[0] & 0x0F
-		masked := (buf[1] & 0x80) != 0
-		length := int(buf[1] & 0x7F)
-		offset := 2
-		if length == 126 {
-			if n < 4 {
-				continue
-			}
-			length = int(buf[2])<<8 | int(buf[3])
-			offset = 4
-		} else if length == 127 {
-			if n < 10 {
-				continue
-			}
-			length = 0
-			for i := 0; i < 8; i++ {
-				length = length<<8 | int(buf[2+i])
-			}
-			offset = 10
-		}
-		var maskKey []byte
-		if masked {
-			if n < offset+4 {
-				continue
-			}
-			maskKey = buf[offset : offset+4]
-			offset += 4
-		}
-		if n < offset+length {
-			continue
-		}
-		payload := make([]byte, length)
-		copy(payload, buf[offset:offset+length])
-		if masked {
-			for i := range payload {
-				payload[i] ^= maskKey[i%4]
-			}
-		}
-		if opcode == 0x8 {
-			log.Printf("ws echo: close frame")
-			return
-		}
-		resp := []byte{0x80 | opcode}
-		if length < 126 {
-			resp = append(resp, byte(length))
-		} else if length < 65536 {
-			resp = append(resp, 126, byte(length>>8), byte(length))
-		} else {
-			resp = append(resp, 127)
-			for i := 7; i >= 0; i-- {
-				resp = append(resp, byte(length>>(i*8)))
-			}
-		}
-		resp = append(resp, payload...)
-		if _, err = conn.Write(resp); err != nil {
-			log.Printf("ws echo: write err: %v", err)
-			return
-		}
-		log.Printf("ws echo: echoed %d bytes (opcode=0x%X)", length, opcode)
-	}
+// ---------- диагностика / ----------
+
+type probeRow struct {
+	DC  int
+	IP  string
+	OK  bool
+	RTT string
+	Err string
 }
+
+var (
+	prMu    sync.Mutex
+	prAt    time.Time
+	prCache []probeRow
+)
+
+func runProbes() []probeRow {
+	prMu.Lock()
+	if prCache != nil && time.Since(prAt) < probeTTL {
+		c := prCache
+		prMu.Unlock()
+		return c
+	}
+	prMu.Unlock()
+
+	rows := make([]probeRow, len(probeTargets))
+	var wg sync.WaitGroup
+	for i, t := range probeTargets {
+		wg.Add(1)
+		go func(i int, t probeTarget) {
+			defer wg.Done()
+			addr := t.ip + ":443"
+			start := time.Now()
+			c, err := net.DialTimeout("tcp", addr, probeDial)
+			d := time.Since(start)
+			if err == nil {
+				_ = c.Close()
+				rows[i] = probeRow{t.dc, t.ip, true, d.Round(time.Millisecond).String(), ""}
+			} else {
+				rows[i] = probeRow{t.dc, t.ip, false, "", err.Error()}
+			}
+		}(i, t)
+	}
+	wg.Wait()
+
+	prMu.Lock()
+	prCache = rows
+	prAt = time.Now()
+	prMu.Unlock()
+	return rows
+}
+
+func handleIndex(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	rows := runProbes()
+	mu.Lock()
+	n := len(sessions)
+	mu.Unlock()
+
+	var b strings.Builder
+	b.WriteString("<!doctype html><meta charset=utf-8><title>Relay</title>")
+	b.WriteString("<style>body{font-family:monospace;margin:2em;line-height:1.5}" +
+		".ok{color:#0a0}.fail{color:#c00}td{padding:2px 14px}" +
+		"table{border-collapse:collapse}th{text-align:left}</style>")
+	fmt.Fprintf(&b, "<h2>Relay: OK</h2>")
+	fmt.Fprintf(&b, "<p>uptime %s &middot; %s UTC<br>active sessions: %d<br>mode: %s</p>",
+		time.Since(startedAt).Round(time.Second),
+		time.Now().UTC().Format("2006-01-02 15:04:05"),
+		n, mode())
+	b.WriteString("<table><tr><th>DC</th><th>IP</th><th>status</th><th>rtt</th></tr>")
+	for _, row := range rows {
+		if row.OK {
+			fmt.Fprintf(&b, "<tr><td>DC%d</td><td>%s</td><td class=ok>OK</td><td>%s</td></tr>",
+				row.DC, row.IP, row.RTT)
+		} else {
+			fmt.Fprintf(&b, "<tr><td>DC%d</td><td>%s</td><td class=fail>FAIL</td><td>%s</td></tr>",
+				row.DC, row.IP, row.Err)
+		}
+	}
+	b.WriteString("</table>")
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write([]byte(b.String()))
+}
+
+// ---------- main ----------
 
 func main() {
 	if token == "" {
-		log.Println("WARNING: RELAY_TOKEN not set — running in OPEN mode (unsafe for public host)")
+		log.Println("WARNING: RELAY_TOKEN not set — PUBLIC mode, dst limited to Telegram DC whitelist")
+	} else {
+		log.Println("relay running in PRIVATE mode (token required)")
 	}
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -324,7 +366,7 @@ func main() {
 	mux.HandleFunc("/down", handleDown)
 	mux.HandleFunc("/close", handleClose)
 	mux.HandleFunc("/probe", handleProbe)
-	mux.HandleFunc("/wsecho", handleWsEcho)
+	mux.HandleFunc("/", handleIndex)
 	log.Printf("relay listening on :%s", port)
 	log.Fatal(http.ListenAndServe(":"+port, mux))
 }
