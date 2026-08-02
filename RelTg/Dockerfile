@@ -1,9 +1,10 @@
-FROM golang:1.22-alpine AS build
+FROM golang:1.22-alpine AS builder
 WORKDIR /src
-COPY go.mod main.go ./
+COPY . .
 ARG VERSION=dev
-RUN CGO_ENABLED=0 go build -ldflags="-s -w -X main.buildVersion=$VERSION" -o /relay .
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X main.buildVersion=$VERSION" -o /usr/local/bin/relay .
 
-FROM scratch
-COPY --from=build /relay /relay
-ENTRYPOINT ["/relay"]
+FROM alpine:3.20
+RUN apk --no-cache add ca-certificates
+COPY --from=builder /usr/local/bin/relay /usr/local/bin/relay
+CMD ["/usr/local/bin/relay"]
