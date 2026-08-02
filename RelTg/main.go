@@ -25,6 +25,7 @@ const (
 )
 
 var token = os.Getenv("RELAY_TOKEN")
+var buildVersion = "dev" // injected at build via -ldflags -X main.buildVersion
 
 // Telegram production DC IPs. В OPEN-режиме (без токена) relay принимает
 // dst ТОЛЬКО из этого набора — иначе нода превращается в открытый прокси.
@@ -328,10 +329,10 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 		".ok{color:#0a0}.fail{color:#c00}td{padding:2px 14px}" +
 		"table{border-collapse:collapse}th{text-align:left}</style>")
 	fmt.Fprintf(&b, "<h2>Relay: OK</h2>")
-	fmt.Fprintf(&b, "<p>uptime %s &middot; %s UTC<br>active sessions: %d<br>mode: %s</p>",
+	fmt.Fprintf(&b, "<p>uptime %s &middot; %s UTC<br>active sessions: %d<br>mode: %s<br>build: %s</p>",
 		time.Since(startedAt).Round(time.Second),
 		time.Now().UTC().Format("2006-01-02 15:04:05"),
-		n, mode())
+		n, mode(), buildVersion)
 	b.WriteString("<table><tr><th>DC</th><th>IP</th><th>status</th><th>rtt</th></tr>")
 	for _, row := range rows {
 		if row.OK {
@@ -352,6 +353,7 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 // ---------- main ----------
 
 func main() {
+	log.Printf("relay build: %s", buildVersion)
 	if token == "" {
 		log.Println("WARNING: RELAY_TOKEN not set — PUBLIC mode, dst limited to Telegram DC whitelist")
 	} else {

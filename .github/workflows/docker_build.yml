@@ -23,4 +23,7 @@ jobs:
           context: ./RelTg
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ secrets.DOCKERHUB_USER }}/relay:latest
+          build-args: VERSION=${{ github.sha }}
+          tags: |
+            ${{ secrets.DOCKERHUB_USER }}/relay:latest
+            ${{ secrets.DOCKERHUB_USER }}/relay:${{ github.sha }}

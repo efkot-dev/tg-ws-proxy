@@ -3,7 +3,8 @@ ARG TARGETOS=linux
 ARG TARGETARCH=amd64
 WORKDIR /src
 COPY go.mod main.go ./
-RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags="-s -w" -o /relay .
+ARG VERSION=dev
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags="-s -w -X main.buildVersion=$VERSION" -o /relay .
 FROM scratch
 COPY --from=build /relay /relay
 ENTRYPOINT ["/relay"]
